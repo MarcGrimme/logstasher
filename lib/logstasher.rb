@@ -1,5 +1,9 @@
 require 'logstasher/version'
-require 'logstasher/log_subscriber'
+require 'logstasher/active_support/log_subscriber'
+require 'logstasher/active_support/mailer_log_subscriber'
+require 'logstasher/active_record/log_subscriber'
+require 'logstasher/action_view/log_subscriber'
+require 'logstasher/rails_ext/action_controller/base'
 require 'request_store'
 require 'active_support/core_ext/module/attribute_accessors'
 require 'active_support/core_ext/string/inflections'
@@ -10,14 +14,15 @@ module LogStasher
   STORE_KEY = :logstasher_data
   REQUEST_CONTEXT_KEY = :logstasher_request_context
 
-  attr_accessor :logger, :logger_path, :enabled, :log_controller_parameters, :source, :backtrace
+  attr_accessor :logger, :logger_path, :enabled, :log_controller_parameters, :source, :backtrace, 
+    :delayed_jobs_support, :controller_monkey_patch
   # Setting the default to 'unknown' to define the default behaviour
   @source = 'unknown'
   # By default log the backtrace of exceptions
   @backtrace = true
 
   def remove_existing_log_subscriptions
-    ActiveSupport::LogSubscriber.log_subscribers.each do |subscriber|
+    ::ActiveSupport::LogSubscriber.log_subscribers.each do |subscriber|
       case subscriber.class.name
         when 'ActionView::LogSubscriber'
           unsubscribe(:action_view, subscriber)
@@ -32,9 +37,9 @@ module LogStasher
   def unsubscribe(component, subscriber)
     events = subscriber.public_methods(false).reject{ |method| method.to_s == 'call' }
     events.each do |event|
-      ActiveSupport::Notifications.notifier.listeners_for("#{event}.#{component}").each do |listener|
+      ::ActiveSupport::Notifications.notifier.listeners_for("#{event}.#{component}").each do |listener|
         if listener.instance_variable_get('@delegate') == subscriber
-          ActiveSupport::Notifications.unsubscribe listener
+          ::ActiveSupport::Notifications.unsubscribe listener
         end
       end
     end
@@ -46,7 +51,7 @@ module LogStasher
     payload[:request_id] = request.env['action_dispatch.request_id']
     self.custom_fields += [:ip, :route, :request_id]
     if self.log_controller_parameters
-      payload[:parameters] = payload[:params].except(*ActionController::LogSubscriber::INTERNAL_PARAMS)
+      payload[:parameters] = payload[:params].except(*::ActionController::LogSubscriber::INTERNAL_PARAMS)
       self.custom_fields += [:parameters]
     end
   end
@@ -56,8 +61,8 @@ module LogStasher
       LogStasher.custom_fields.concat(LogStasher.store.keys)
       instance_exec(fields, &block)
     end
-    ActionController::Metal.send(:define_method, :logtasher_add_custom_fields_to_payload, &wrapped_block)
-    ActionController::Base.send(:define_method, :logtasher_add_custom_fields_to_payload, &wrapped_block)
+    ::ActionController::Metal.send(:define_method, :logtasher_add_custom_fields_to_payload, &wrapped_block)
+    ::ActionController::Base.send(:define_method, :logtasher_add_custom_fields_to_payload, &wrapped_block)
   end
 
   def add_custom_fields_to_request_context(&block)
@@ -65,8 +70,8 @@ module LogStasher
       instance_exec(fields, &block)
       LogStasher.custom_fields.concat(fields.keys)
     end
-    ActionController::Metal.send(:define_method, :logstasher_add_custom_fields_to_request_context, &wrapped_block)
-    ActionController::Base.send(:define_method, :logstasher_add_custom_fields_to_request_context, &wrapped_block)
+    ::ActionController::Metal.send(:define_method, :logstasher_add_custom_fields_to_request_context, &wrapped_block)
+    ::ActionController::Base.send(:define_method, :logstasher_add_custom_fields_to_request_context, &wrapped_block)
   end
 
   def add_default_fields_to_request_context(request)
@@ -80,11 +85,16 @@ module LogStasher
   def setup(app)
     app.config.action_dispatch.rack_cache[:verbose] = false if app.config.action_dispatch.rack_cache
     # Path instrumentation class to insert our hook
-    require 'logstasher/rails_ext/action_controller/metal/instrumentation'
+    if app.config.logstasher.controller_monkey_patch || true
+      require 'logstasher/rails_ext/action_controller/metal/instrumentation'
+    end
     require 'logstash-event'
+    self.delayed_plugin(app)
     self.suppress_app_logs(app)
-    LogStasher::RequestLogSubscriber.attach_to :action_controller
-    LogStasher::MailerLogSubscriber.attach_to :action_mailer
+    LogStasher::ActiveSupport::LogSubscriber.attach_to :action_controller
+    LogStasher::ActiveSupport::MailerLogSubscriber.attach_to :action_mailer
+    LogStasher::ActiveRecord::LogSubscriber.attach_to :active_record
+    LogStasher::ActionView::LogSubscriber.attach_to :action_view
     self.logger_path = app.config.logstasher.logger_path || "#{Rails.root}/log/logstash_#{Rails.env}.log"
     self.logger = app.config.logstasher.logger || new_logger(self.logger_path)
     self.logger.level = app.config.logstasher.log_level || Logger::WARN
@@ -92,6 +102,23 @@ module LogStasher
     self.enabled = true
     self.log_controller_parameters = !! app.config.logstasher.log_controller_parameters
     self.backtrace = !! app.config.logstasher.backtrace unless app.config.logstasher.backtrace.nil?
+    set_data_for_rake if called_as_rake?
+  end
+
+  def set_data_for_rake
+    self.request_context["request_id"] = Rake.application.top_level_tasks
+    self.source = "rake"
+  end
+
+  def called_as_rake?
+    File.basename($0) == 'rake'
+  end
+
+  def delayed_plugin(app)
+    if app.config.logstasher.delayed_jobs_support || false
+      require 'logstasher/delayed/plugin'
+      ::Delayed::Worker.plugins << ::LogStasher::Delayed::Plugin
+    end
   end
 
   def suppress_app_logs(app)
@@ -135,7 +162,7 @@ module LogStasher
 
   def watch(event, opts = {}, &block)
     event_group = opts[:event_group] || event
-    ActiveSupport::Notifications.subscribe(event) do |*args|
+    ::ActiveSupport::Notifications.subscribe(event) do |*args|
       # Calling the processing block with the Notification args and the store
       block.call(*args, store[event_group])
     end

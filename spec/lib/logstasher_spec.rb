@@ -1,4 +1,6 @@
 require 'spec_helper'
+require 'active_record'
+require 'delayed_job'
 
 describe LogStasher do
   describe "when removing Rails' log subscribers" do
@@ -94,7 +96,9 @@ describe LogStasher do
 
   shared_examples 'setup' do
     let(:logstasher_source) { nil }
-    let(:logstasher_config) { double(:logger => logger, :log_level => 'warn', :log_controller_parameters => nil, :source => logstasher_source, :logger_path => logger_path, :backtrace => true) }
+    let(:logstasher_config) { double(:logger => logger, :log_level => 'warn', :log_controller_parameters => nil,
+                                     :source => logstasher_source, :logger_path => logger_path, :backtrace => true,
+                                     :controller_monkey_patch => true, :delayed_jobs_support => false) }
     let(:config) { double(:logstasher => logstasher_config) }
     let(:app) { double(:config => config) }
     before do
@@ -107,8 +111,8 @@ describe LogStasher do
       expect(LogStasher).to receive(:require).with('logstasher/rails_ext/action_controller/metal/instrumentation')
       expect(LogStasher).to receive(:require).with('logstash-event')
       expect(LogStasher).to receive(:suppress_app_logs).with(app)
-      expect(LogStasher::RequestLogSubscriber).to receive(:attach_to).with(:action_controller)
-      expect(LogStasher::MailerLogSubscriber).to receive(:attach_to).with(:action_mailer)
+      expect(LogStasher::ActiveSupport::LogSubscriber).to receive(:attach_to).with(:action_controller)
+      expect(LogStasher::ActiveSupport::MailerLogSubscriber).to receive(:attach_to).with(:action_mailer)
       expect(logger).to receive(:level=).with('warn')
       LogStasher.setup(app)
       expect(LogStasher.source).to eq (logstasher_source || 'unknown')
@@ -173,6 +177,23 @@ describe LogStasher do
             LogStasher.suppress_app_logs(app)
           end
         end
+      end
+    end
+  end
+
+  describe '.delayed_jobs_support' do
+    let(:logstasher_config){ double(:logstasher => double(:delayed_jobs_support => true))}
+    let(:app){ double(:config => logstasher_config)}
+
+    it 'loades the delayed job plugin' do
+      LogStasher.delayed_plugin(app)
+      expect(Delayed::Worker.plugins).to include(::LogStasher::Delayed::Plugin)
+    end
+    context 'when disabled' do
+      let(:logstasher_config){ double(:logstasher => double(:delayed_jobs_support => false))}
+      it 'does not load the delayed job plugin' do
+        expect(LogStasher).to_not receive(:require).with('logstasher/delayed/plugin')
+        LogStasher.delayed_plugin(app)
       end
     end
   end
