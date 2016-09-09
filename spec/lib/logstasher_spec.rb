@@ -8,6 +8,7 @@ describe LogStasher do
       ActionController::LogSubscriber.attach_to :action_controller
       ActionView::LogSubscriber.attach_to :action_view
       ActionMailer::LogSubscriber.attach_to :action_mailer
+      ActiveJob::Logging::LogSubscriber.attach_to :active_job if LogStasher.has_active_job?
     end
 
     it "should remove subscribers for controller events" do
@@ -16,6 +17,18 @@ describe LogStasher do
       }.to change {
         ActiveSupport::Notifications.notifier.listeners_for('process_action.action_controller')
       }
+    end
+
+    it "should remove subscribers for job events" do
+      if LogStasher.has_active_job?
+        expect {
+          LogStasher.remove_existing_log_subscriptions
+        }.to change {
+          ActiveSupport::Notifications.notifier.listeners_for('perform.active_job')
+        }
+      else
+        expect(ActiveSupport::Notifications.notifier.listeners_for('perform.active_job')).to eq([])
+      end
     end
 
     it "should remove subscribers for all events" do
@@ -48,24 +61,24 @@ describe LogStasher do
     let(:payload) { {:params => params} }
     let(:request) { double(:params => params, :remote_ip => '10.0.0.1', :env => {})}
     after do
-      LogStasher.custom_fields = []
+      LogStasher::CustomFields.clear
       LogStasher.log_controller_parameters = false
     end
     it 'appends default parameters to payload' do
       LogStasher.log_controller_parameters = true
-      LogStasher.custom_fields = []
+      LogStasher::CustomFields.clear
       LogStasher.add_default_fields_to_payload(payload, request)
       expect(payload[:ip]).to eq '10.0.0.1'
       expect(payload[:route]).to eq 'test#action'
       expect(payload[:parameters]).to eq 'a' => '1', 'b' => 2
-      expect(LogStasher.custom_fields).to eq [:ip, :route, :request_id, :parameters]
+      expect(LogStasher::CustomFields.custom_fields).to eq [:ip, :route, :request_id, :parameters]
     end
 
     it 'does not include parameters when not configured to' do
-      LogStasher.custom_fields = []
+      LogStasher::CustomFields.clear
       LogStasher.add_default_fields_to_payload(payload, request)
       expect(payload).to_not have_key(:parameters)
-      expect(LogStasher.custom_fields).to eq [:ip, :route, :request_id]
+      expect(LogStasher::CustomFields.custom_fields).to eq [:ip, :route, :request_id]
     end
   end
 
@@ -112,16 +125,17 @@ describe LogStasher do
       expect(LogStasher::ActiveSupport::MailerLogSubscriber).to receive(:attach_to).with(:action_mailer)
       expect(LogStasher::ActiveRecord::LogSubscriber).to receive(:attach_to).with(:active_record)
       expect(LogStasher::ActionView::LogSubscriber).to receive(:attach_to).with(:action_view)
+      expect(LogStasher::ActiveJob::LogSubscriber).to receive(:attach_to).with(:active_job)
       expect(LogStasher).to receive(:require).with('logstash-event')
     end
-    
   end
   shared_examples 'setup' do
     let(:logstasher_source) { nil }
-    let(:logstasher_config) { double(:enabled => true, 
+    let(:logstasher_config) { double(:enabled => true,
                                      :logger => logger, :log_level => 'warn', :log_controller_parameters => nil,
                                      :source => logstasher_source, :logger_path => logger_path, :backtrace => true,
-                                     :controller_monkey_patch => true) }
+                                     :controller_monkey_patch => true, :controller_enabled => true,
+                                     :mailer_enabled => true, :record_enabled => false, :view_enabled => true, :job_enabled => true) }
     let(:config) { double(:logstasher => logstasher_config) }
     let(:app) { double(:config => config) }
     before do
@@ -138,7 +152,7 @@ describe LogStasher do
       LogStasher.setup(config.logstasher)
       expect(LogStasher.source).to eq (logstasher_source || 'unknown')
       expect(LogStasher).to be_enabled
-      expect(LogStasher.custom_fields).to be_empty
+      expect(LogStasher::CustomFields.custom_fields).to be_empty
       expect(LogStasher.log_controller_parameters).to eq false
       expect(LogStasher.request_context).to be_empty
     end
@@ -203,20 +217,6 @@ describe LogStasher do
     end
   end
 
-  describe '.appended_params' do
-    it 'returns the stored var in current thread' do
-      Thread.current[:logstasher_custom_fields] = :test
-      expect(LogStasher.custom_fields).to eq :test
-    end
-  end
-
-  describe '.appended_params=' do
-    it 'returns the stored var in current thread' do
-      LogStasher.custom_fields = :test
-      expect(Thread.current[:logstasher_custom_fields]).to eq :test
-    end
-  end
-
   describe '.log' do
     let(:logger) { double() }
     before do
@@ -225,6 +225,7 @@ describe LogStasher do
       allow(Time).to receive_messages(:now => Time.at(0))
       allow_message_expectations_on_nil
     end
+    after { LogStasher::CustomFields.clear }
     it 'adds to log with specified level' do
       expect(logger).to receive(:<<).with('{"level":"warn","message":"WARNING","source":"unknown","tags":["log"],"@timestamp":"'+$test_timestamp+'","@version":"1"}'+"\n")
       LogStasher.log('warn', 'WARNING')
@@ -278,7 +279,7 @@ describe LogStasher do
   end
 
   describe ".watch" do
-    before(:each) { LogStasher.custom_fields = [] }
+    before(:each) { LogStasher::CustomFields.custom_fields = [] }
 
     it "subscribes to the required event" do
       expect(ActiveSupport::Notifications).to receive(:subscribe).with('event_name')
@@ -301,7 +302,7 @@ describe LogStasher do
       end
     end
   end
-  
+
   describe ".enabled?" do
     it "returns false if not enabled" do
       expect(LogStasher).to receive(:enabled).and_return(false)
@@ -311,12 +312,12 @@ describe LogStasher do
       expect(LogStasher.enabled?).to be true
     end
   end
-  
+
   describe ".called_as_rake?" do
     it "returns false if not called as rake" do
       expect(LogStasher.called_as_rake?).to be false
     end
-    
+
     it "returns true if called as rake" do
       expect(File).to receive(:basename).with($0).and_return('rake')
       expect(LogStasher.called_as_rake?).to be true
@@ -327,7 +328,7 @@ describe LogStasher do
     it "does not touch request_context if not called as rake" do
       expect(LogStasher.request_context).to be_empty
     end
-    
+
     it "sets request_context accordingly if called as rake" do
       expect(LogStasher).to receive(:called_as_rake?).and_return(true)
       expect(Rake.application).to receive(:top_level_tasks).and_return(['mytask'])
@@ -341,10 +342,33 @@ describe LogStasher do
     it "returns false if not called as console" do
       expect(LogStasher.called_as_console?).to be false
     end
-    
+
     it "returns true if called as rake" do
       require 'rails/commands/console'
       expect(LogStasher.called_as_console?).to be true
+    end
+  end
+
+  describe '.has_active_job?' do
+    it 'returns false when < Rails 4.2' do
+      stub_const('Rails::VERSION::MAJOR', 4)
+      stub_const('Rails::VERSION::MINOR', 1)
+
+      expect(LogStasher.has_active_job?).to be false
+    end
+
+    it 'returns true when Rails 4.2' do
+      stub_const('Rails::VERSION::MAJOR', 4)
+      stub_const('Rails::VERSION::MINOR', 2)
+
+      expect(LogStasher.has_active_job?).to be true
+    end
+
+    it 'returns true when Rails 5' do
+      stub_const('Rails::VERSION::MAJOR', 5)
+      stub_const('Rails::VERSION::MINOR', 0)
+
+      expect(LogStasher.has_active_job?).to be true
     end
   end
 
@@ -352,7 +376,7 @@ describe LogStasher do
     it "does not touch request_context if not called as console" do
       expect(LogStasher.request_context).to be_empty
     end
-    
+
     it "sets request_context accordingly if called as console" do
       require 'rails/commands/console'
       expect(LogStasher).to receive(:called_as_console?).and_return(true)
