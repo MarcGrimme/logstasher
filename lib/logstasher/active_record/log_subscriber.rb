@@ -50,7 +50,12 @@ module LogStasher
       end
 
       def extract_sql(data)
-        { sql: data[:sql].squeeze(' ') }
+        new_data = {}
+        if data.has_key?(:binds) 
+          new_data[:binds] = binds.to_s
+        end
+        new_data[:sql] = data[:sql].squeeze(' ')
+        new_data
       end
     end
   end
