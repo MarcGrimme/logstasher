@@ -24,10 +24,10 @@ module LogStasher
         return unless logger.debug?
         return if 'SCHEMA' == data[:name]
 
+        data = extract_sql(data)
         data.merge! runtimes(event)
-        data.merge! extract_sql(data)
         data.merge! request_context
-        data.merge! extract_custom_fields(data)
+        data.merge! extract_custom_fields(event.payload)
 
         ::LogStash::Event.new(data.merge(source: LogStasher.source))
       end
