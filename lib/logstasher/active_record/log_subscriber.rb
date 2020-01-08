@@ -26,11 +26,11 @@ module LogStasher
 
         return if 'SCHEMA' == data[:name]
 
+        data = extract_sql(data)
         data.merge! runtimes(event)
-        data.merge! extract_sql(data)
         data.merge! request_context
         data.merge! LogStasher.store
-        data.merge! extract_custom_fields(data)
+        data.merge! extract_custom_fields(event.payload)
 
         tags = [ 'request' ]
         tags.push('exception') if data[:exception]
